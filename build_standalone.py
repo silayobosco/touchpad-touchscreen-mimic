@@ -16,6 +16,14 @@ import shutil
 import subprocess
 import sys
 
+# Ensure UTF-8 output even on legacy Windows terminals / cp1252 runners
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 PROJECT_ROOT = os.path.dirname(os.path.realpath(__file__))
 ENTRY_POINT = os.path.join(PROJECT_ROOT, "touchmimic", "__main__.py")
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
@@ -33,7 +41,7 @@ def check_pyinstaller() -> bool:
 
 def install_pyinstaller() -> bool:
     """Attempt to install PyInstaller via pip."""
-    print("📦 PyInstaller not found. Attempting to install via pip...")
+    print("[*] PyInstaller not found. Attempting to install via pip...")
     res = subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller"], check=False)
     return res.returncode == 0
 
@@ -46,12 +54,12 @@ def build_binary(
 ) -> int:
     system = platform.system().lower()
     print(f"\n========================================================")
-    print(f"🚀 Building TouchMimic Standalone Binary for: {platform.system()} ({platform.machine()})")
+    print(f"[*] Building TouchMimic Standalone Binary for: {platform.system()} ({platform.machine()})")
     print(f"========================================================\n")
 
     if not check_pyinstaller():
         if not install_pyinstaller():
-            print("❌ Failed to install PyInstaller. Please run: pip install pyinstaller")
+            print("[-] Failed to install PyInstaller. Please run: pip install pyinstaller")
             return 1
 
     cmd = [
@@ -133,22 +141,22 @@ def build_binary(
 
     result = subprocess.run(cmd, cwd=PROJECT_ROOT)
     if result.returncode != 0:
-        print("\n❌ PyInstaller build failed.")
+        print("\n[-] PyInstaller build failed.")
         return result.returncode
 
-    print("\n✅ Build succeeded!")
+    print("\n[+] Build succeeded!")
     if system == "windows":
         exe_path = os.path.join(DIST_DIR, f"{target_name}.exe")
-        print(f"📦 Executable located at: {exe_path}")
+        print(f"[+] Executable located at: {exe_path}")
     elif system == "darwin":
         app_path = os.path.join(DIST_DIR, f"{target_name}.app")
-        print(f"📦 macOS Application located at: {app_path}")
+        print(f"[+] macOS Application located at: {app_path}")
     else:
         bin_path = os.path.join(DIST_DIR, target_name)
-        print(f"📦 Linux binary located at: {bin_path}")
+        print(f"[+] Linux binary located at: {bin_path}")
         # Copy setup-permissions.sh into dist for convenience
         shutil.copy(os.path.join(PROJECT_ROOT, "setup-permissions.sh"), DIST_DIR)
-        print(f"📄 Copied setup-permissions.sh to: {DIST_DIR}")
+        print(f"[+] Copied setup-permissions.sh to: {DIST_DIR}")
 
     return 0
 
