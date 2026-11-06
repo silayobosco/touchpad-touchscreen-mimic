@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "touchmimic"
+version = "1.1.0"
+description = "Turn your laptop touchpad into an on-demand 1:1 touchscreen mapped to your active window on Linux, Windows, and macOS."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "silayobosco", email = "johnboscosilayo@gmail.com" }
+]
+keywords = ["touchpad", "touchscreen", "linux", "windows", "macos", "wayland", "uinput", "pyqt6", "android-emulator", "tiktok"]
+dependencies = [
+    "PyQt6>=6.4.0",
+]
+
+[project.scripts]
+touchmimic = "touchmimic.cli:main"
+
+[project.gui-scripts]
+touchmimic-gui = "touchmimic.cli:main"

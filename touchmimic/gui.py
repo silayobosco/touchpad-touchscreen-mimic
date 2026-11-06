@@ -36,10 +36,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .linux_input import (
-    TouchpadMimicEngine,
-    check_permissions,
-    grant_permissions_via_pkexec,
+from .platform_backend import (
+    check_platform_permissions,
+    create_platform_engine,
+    get_os_name,
+    grant_platform_permissions,
 )
 from .window_tracker import WindowGeometry, WindowTracker
 
@@ -326,7 +327,7 @@ class TouchMimicController(QMainWindow):
         self.screen_w = sg.width()
         self.screen_h = sg.height()
 
-        self.engine = TouchpadMimicEngine(
+        self.engine = create_platform_engine(
             on_state_changed=lambda act: self.engineStateSignal.emit(act),
             on_touch_update=lambda nx, ny, t, f: self.engineTouchSignal.emit(nx, ny, t, f),
             on_error=lambda err: self.engineErrorSignal.emit(err),
@@ -615,7 +616,7 @@ class TouchMimicController(QMainWindow):
         self.tray.show()
 
     def _try_start_engine(self) -> None:
-        ok, msg = check_permissions()
+        ok, msg = check_platform_permissions()
         if not ok:
             self.perm_frame.setVisible(True)
             self.device_label.setText(f"Status: {msg}")
@@ -630,7 +631,7 @@ class TouchMimicController(QMainWindow):
         self.grant_btn.setEnabled(False)
         self.grant_btn.setText("Waiting for authentication...")
         QApplication.processEvents()
-        ok, msg = grant_permissions_via_pkexec(install_udev=True)
+        ok, msg = grant_platform_permissions()
         self.grant_btn.setEnabled(True)
         self.grant_btn.setText("🔑 Grant Input Permissions")
         if ok:
@@ -712,24 +713,32 @@ class TouchMimicController(QMainWindow):
             active,
             self.engine.margin_pct,
         )
-        # Desktop notification for clear feedback when toggled via hotkey/CLI
         state_str = "ENABLED" if active else "DISABLED (Normal Touchpad)"
-        try:
-            subprocess.Popen(
-                [
-                    "notify-send",
-                    "-a",
-                    "TouchMimic",
-                    "-t",
-                    "1500",
-                    f"TouchMimic: {state_str}",
-                    f"Target: {target.summary()}",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+        if get_os_name() == "linux":
+            try:
+                subprocess.Popen(
+                    [
+                        "notify-send",
+                        "-a",
+                        "TouchMimic",
+                        "-t",
+                        "1500",
+                        f"TouchMimic: {state_str}",
+                        f"Target: {target.summary()}",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except Exception:
+                pass
+        if hasattr(self, "tray") and self.tray.isVisible():
+            self.tray.showMessage(
+                f"TouchMimic: {state_str}",
+                f"Target: {target.summary()}",
+                QSystemTrayIcon.MessageIcon.Information,
+                1500,
             )
-        except Exception:
-            pass
 
     def _on_engine_touch_update(
         self, norm_x: float, norm_y: float, touching: bool, fingers: int

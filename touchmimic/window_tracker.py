@@ -1,16 +1,24 @@
-"""Active window geometry tracker and DBus IPC controller for KDE KWin Wayland & X11."""
+"""Cross-platform Active Window Geometry Tracker & IPC Controller (Linux KWin/DBus, Windows Win32, macOS Quartz)."""
 
 from __future__ import annotations
 
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtDBus import QDBusConnection, QDBusInterface, QDBusMessage
+
+from .platform_backend import LocalSocketIPCServer, get_os_name
+
+try:
+    from PyQt6.QtDBus import QDBusConnection, QDBusInterface, QDBusMessage
+    HAS_QTDBUS = True
+except ImportError:
+    HAS_QTDBUS = False
 
 DBUS_SERVICE = "org.antigravity.TouchMimic"
 DBUS_PATH = "/TouchMimic"
@@ -95,7 +103,7 @@ if (workspace.activeWindow) {
 
 
 class DBusBridge(QObject):
-    """Exposes DBus methods for KWin script callbacks and CLI commands (`touchmimic toggle`)."""
+    """Exposes DBus methods on Linux and forwards commands from LocalSocketIPCServer on all platforms."""
 
     windowUpdated = pyqtSignal(object)  # emits WindowGeometry
     commandReceived = pyqtSignal(str)   # "toggle", "on", "off", "pin", "show"
@@ -151,7 +159,7 @@ class DBusBridge(QObject):
 
 
 class WindowTracker(QObject):
-    """Manages active window tracking, window pinning, and KWin/X11 integration."""
+    """Manages active window tracking, window pinning, and IPC across Linux, Windows, and macOS."""
 
     targetChanged = pyqtSignal(object)  # WindowGeometry
 
@@ -165,6 +173,7 @@ class WindowTracker(QObject):
         super().__init__(parent)
         self.screen_width = screen_width
         self.screen_height = screen_height
+        self.os_name = get_os_name()
 
         # Target mode: "active_window", "pinned_window", "fullscreen"
         self.target_mode: str = "active_window"
@@ -179,33 +188,78 @@ class WindowTracker(QObject):
         self.pinned_window: Optional[WindowGeometry] = None
 
         self.bridge = DBusBridge(status_provider, self)
-        self.bridge.windowUpdated.connect(self._on_kwin_window_updated)
+        self.bridge.windowUpdated.connect(self._on_window_updated)
+
+        self.ipc_server = LocalSocketIPCServer(
+            command_handler=lambda cmd: self.bridge.commandReceived.emit(cmd),
+            status_provider=status_provider,
+        )
 
         self._js_temp_path: Optional[str] = None
         self._bus_registered = False
+        self._poll_timer: Optional[QTimer] = None
 
     def start(self) -> bool:
-        bus = QDBusConnection.sessionBus()
-        if bus.isConnected():
-            ok_svc = bus.registerService(DBUS_SERVICE)
-            ok_obj = bus.registerObject(
-                DBUS_PATH,
-                self.bridge,
-                QDBusConnection.RegisterOption.ExportAllSlots,
-            )
-            self._bus_registered = ok_svc and ok_obj
+        ipc_ok = self.ipc_server.start()
 
-        self._install_kwin_script()
-        return self._bus_registered
+        if self.os_name == "linux" and HAS_QTDBUS:
+            bus = QDBusConnection.sessionBus()
+            if bus.isConnected():
+                ok_svc = bus.registerService(DBUS_SERVICE)
+                ok_obj = bus.registerObject(
+                    DBUS_PATH,
+                    self.bridge,
+                    QDBusConnection.RegisterOption.ExportAllSlots,
+                )
+                self._bus_registered = ok_svc and ok_obj
+            self._install_kwin_script()
+        elif self.os_name in ("windows", "macos"):
+            self._poll_timer = QTimer(self)
+            self._poll_timer.setInterval(300)
+            self._poll_timer.timeout.connect(self._poll_os_active_window)
+            self._poll_timer.start()
+            self._poll_os_active_window()
+
+        return self._bus_registered or ipc_ok
 
     def stop(self) -> None:
-        self._unload_kwin_script()
-        if self._js_temp_path and os.path.exists(self._js_temp_path):
-            try:
-                os.unlink(self._js_temp_path)
-            except OSError:
-                pass
-            self._js_temp_path = None
+        self.ipc_server.stop()
+        if self._poll_timer:
+            self._poll_timer.stop()
+            self._poll_timer = None
+        if self.os_name == "linux":
+            self._unload_kwin_script()
+            if self._js_temp_path and os.path.exists(self._js_temp_path):
+                try:
+                    os.unlink(self._js_temp_path)
+                except OSError:
+                    pass
+                self._js_temp_path = None
+
+    def _poll_os_active_window(self) -> None:
+        info = None
+        if self.os_name == "windows":
+            from .windows_input import get_windows_foreground_window_rect
+            info = get_windows_foreground_window_rect()
+        elif self.os_name == "macos":
+            from .macos_input import get_macos_frontmost_window_rect
+            info = get_macos_frontmost_window_rect()
+
+        if info is not None:
+            cap, cls_name, x, y, w, h = info
+            geom = WindowGeometry(
+                caption=cap,
+                resource_class=cls_name,
+                x=x,
+                y=y,
+                width=w,
+                height=h,
+            )
+            if (
+                geom.caption != self.last_active_window.caption
+                or geom.rect != self.last_active_window.rect
+            ):
+                self._on_window_updated(geom)
 
     def _install_kwin_script(self) -> None:
         self._unload_kwin_script()
@@ -272,34 +326,35 @@ class WindowTracker(QObject):
         except Exception:
             pass
 
-    def refresh_active_window(self) -> None:
-        """Reload KWin script to force an immediate activeWindow report."""
-        self._install_kwin_script()
-
     def pick_window_interactively(self) -> Optional[WindowGeometry]:
-        """Use KWin's interactive crosshair queryWindowInfo() to pick and pin any window."""
-        try:
-            bus = QDBusConnection.sessionBus()
-            iface = QDBusInterface("org.kde.KWin", "/KWin", "org.kde.KWin", bus)
-            reply = iface.call("queryWindowInfo")
-            if reply.type() == QDBusMessage.MessageType.ReplyMessage and reply.arguments():
-                info = reply.arguments()[0]
-                if isinstance(info, dict):
-                    geom = WindowGeometry(
-                        caption=str(info.get("caption") or "Picked Window"),
-                        resource_class=str(info.get("resourceClass") or ""),
-                        x=int(info.get("x", 0)),
-                        y=int(info.get("y", 0)),
-                        width=max(1, int(info.get("width", self.screen_width))),
-                        height=max(1, int(info.get("height", self.screen_height))),
-                    )
-                    self.pinned_window = geom
-                    self.target_mode = "pinned_window"
-                    self.targetChanged.emit(self.current_target())
-                    return geom
-        except Exception:
-            pass
-        return None
+        """Interactive window picker (KWin crosshair on Linux, active window lock on Windows/macOS)."""
+        if self.os_name == "linux" and HAS_QTDBUS:
+            try:
+                bus = QDBusConnection.sessionBus()
+                iface = QDBusInterface("org.kde.KWin", "/KWin", "org.kde.KWin", bus)
+                reply = iface.call("queryWindowInfo")
+                if reply.type() == QDBusMessage.MessageType.ReplyMessage and reply.arguments():
+                    info = reply.arguments()[0]
+                    if isinstance(info, dict):
+                        geom = WindowGeometry(
+                            caption=str(info.get("caption") or "Picked Window"),
+                            resource_class=str(info.get("resourceClass") or ""),
+                            x=int(info.get("x", 0)),
+                            y=int(info.get("y", 0)),
+                            width=max(1, int(info.get("width", self.screen_width))),
+                            height=max(1, int(info.get("height", self.screen_height))),
+                        )
+                        self.pinned_window = geom
+                        self.target_mode = "pinned_window"
+                        self.targetChanged.emit(self.current_target())
+                        return geom
+            except Exception:
+                pass
+        # Fallback on Windows/macOS: pin the last active non-TouchMimic window
+        self.pinned_window = self.last_active_window
+        self.target_mode = "pinned_window"
+        self.targetChanged.emit(self.current_target())
+        return self.pinned_window
 
     def set_target_mode(self, mode: str) -> None:
         self.target_mode = mode
@@ -332,9 +387,8 @@ class WindowTracker(QObject):
             return self.pinned_window
         return self.last_active_window
 
-    def _on_kwin_window_updated(self, geom: WindowGeometry) -> None:
+    def _on_window_updated(self, geom: WindowGeometry) -> None:
         self.last_active_window = geom
-        # If pinned window has the same resource_class & caption, keep its position updated if moved!
         if (
             self.target_mode == "pinned_window"
             and self.pinned_window is not None
