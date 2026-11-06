@@ -1,0 +1,99 @@
+name: Build Standalone Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            asset_name: TouchMimic-Windows-x64.zip
+          - os: ubuntu-22.04
+            platform: linux
+            asset_name: TouchMimic-Linux-x86_64.tar.gz
+          - os: macos-latest
+            platform: macos
+            asset_name: TouchMimic-macOS-Universal.zip
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install System Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xfixes0 \
+            libxcb-sync1 \
+            libgl1-mesa-glx
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt6
+
+      - name: Build Standalone Binary
+        run: |
+          python build_standalone.py
+
+      - name: Package Release Assets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\TouchMimic.exe, README.md, LICENSE -DestinationPath ${{ matrix.asset_name }}
+
+      - name: Package Release Assets (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x dist/TouchMimic dist/setup-permissions.sh
+          tar -czvf ${{ matrix.asset_name }} -C dist TouchMimic setup-permissions.sh ../README.md ../LICENSE
+
+      - name: Package Release Assets (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          zip -r -y ${{ matrix.asset_name }} dist/TouchMimic.app README.md LICENSE
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+      - name: Publish Release Assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

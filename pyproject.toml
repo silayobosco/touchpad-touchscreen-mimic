@@ -17,6 +17,11 @@ dependencies = [
     "PyQt6>=6.4.0",
 ]
 
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0.0",
+]
+
 [project.scripts]
 touchmimic = "touchmimic.cli:main"
 
