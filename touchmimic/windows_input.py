@@ -70,7 +70,10 @@ TOUCH_MASK_PRESSURE = 0x00000004
 if IS_WINDOWS:
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
-    hid = ctypes.windll.hid
+    try:
+        hid = ctypes.WinDLL("hid.dll")
+    except Exception:
+        hid = None
 
     class MOUSEINPUT(ctypes.Structure):
         _fields_ = [

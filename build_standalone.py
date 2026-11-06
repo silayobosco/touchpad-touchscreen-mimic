@@ -61,6 +61,8 @@ def build_binary(
         "--name",
         target_name,
         "--noconfirm",
+        "--paths",
+        PROJECT_ROOT,
     ]
 
     if clean:
