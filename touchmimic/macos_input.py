@@ -344,3 +344,4 @@ class MacOSTouchMimicEngine:
 
         self._was_touching = is_touching
         return 0
+

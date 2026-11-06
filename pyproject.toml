@@ -22,3 +22,4 @@ touchmimic = "touchmimic.cli:main"
 
 [project.gui-scripts]
 touchmimic-gui = "touchmimic.cli:main"
+

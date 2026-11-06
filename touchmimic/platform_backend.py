@@ -138,3 +138,4 @@ def call_local_socket_ipc(command: str) -> Optional[dict]:
     except Exception:
         pass
     return None
+
