@@ -1,4 +1,4 @@
-"""Pure-Python Windows Precision Touchpad reader, Auto-Drag Engine, and Window Tracker via ctypes."""
+"""Pure-Python Windows Precision Touchpad reader, 1:1 Touchscreen Mimic, and Window Tracker via ctypes."""
 
 from __future__ import annotations
 
@@ -150,12 +150,11 @@ def get_windows_foreground_window_rect(
 
 
 class WindowsTouchMimicEngine:
-    """Robust Windows Touchpad Mimic Engine using Native Cursor Clipping & Touch-Drag.
+    """True 1:1 Touchpad-to-Touchscreen Mimic Engine for Windows.
 
-    Locks the cursor smoothly inside the target window bounds via ClipCursor, and
-    automatically converts physical touchpad contact into native touch-drags.
-    Direction is 100% natural, feedback runaway is completely eliminated, and
-    multi-swipe gestures automatically reset so the next swipe has full travel.
+    Converts physical touchpad contact and movement into true 1:1 touch-drags
+    inside the active or pinned application window (TikTok, Android emulators, etc.)
+    with perfect direction, zero feedback drift, and automatic finger-lift release.
     """
 
     def __init__(
@@ -176,7 +175,7 @@ class WindowsTouchMimicEngine:
 
         self.screen_width: int = 1920
         self.screen_height: int = 1080
-        self._target_rect: Tuple[int, int, int, int] = (0, 0, 1920, 1080)
+        self.target_rect: Tuple[int, int, int, int] = (0, 0, 1920, 1080)
         self.top_inset_px: int = 32
         self.margin_pct: float = 0.03
 
@@ -194,38 +193,11 @@ class WindowsTouchMimicEngine:
         self._is_touching: bool = False
         self._norm_x: float = 0.5
         self._norm_y: float = 0.5
+        self._last_cursor_pt: Optional[Tuple[int, int]] = None
 
         self._release_timer: Optional[threading.Timer] = None
         self._release_timer_lock = threading.Lock()
         self._last_radar_emit: float = 0.0
-
-    @property
-    def target_rect(self) -> Tuple[int, int, int, int]:
-        return self._target_rect
-
-    @target_rect.setter
-    def target_rect(self, val: Tuple[int, int, int, int]) -> None:
-        self._target_rect = val
-        if self.active and IS_WINDOWS:
-            self._apply_cursor_clip()
-
-    def _apply_cursor_clip(self) -> None:
-        if not IS_WINDOWS:
-            return
-        rx, ry, rw, rh = self._target_rect
-        inset = min(self.top_inset_px, max(0, rh - 50))
-        clip_rect = wt.RECT(
-            rx,
-            ry + inset,
-            rx + max(1, rw),
-            ry + max(1, rh),
-        )
-        user32.ClipCursor(ctypes.byref(clip_rect))
-
-    def _remove_cursor_clip(self) -> None:
-        if not IS_WINDOWS:
-            return
-        user32.ClipCursor(None)
 
     def start(self, preferred_device_path: Optional[str] = None) -> Tuple[bool, str]:
         if not IS_WINDOWS:
@@ -237,7 +209,7 @@ class WindowsTouchMimicEngine:
             target=self._win32_loop, daemon=True, name="Win32TouchMimicLoop"
         )
         self._thread.start()
-        return True, f"Connected to {self.device_name} (Auto-Drag & Boundary Lock)"
+        return True, f"Connected to {self.device_name} (1:1 Touchscreen Mimic)"
 
     def stop(self) -> None:
         self.set_active(False)
@@ -261,14 +233,14 @@ class WindowsTouchMimicEngine:
             self._norm_x = 0.5
             self._norm_y = 0.5
 
-            rx, ry, rw, rh = self._target_rect
+            rx, ry, rw, rh = self.target_rect
             inset = min(self.top_inset_px, max(0, rh - 50))
             center_x = rx + max(1, rw) // 2
             center_y = ry + inset + max(1, rh - inset) // 2
 
-            # Place cursor at center of target window and lock cursor within bounds
+            # Place cursor at center of target window
             user32.SetCursorPos(center_x, center_y)
-            self._apply_cursor_clip()
+            self._last_cursor_pt = (center_x, center_y)
 
             # Install hook on worker thread
             if self._thread_id:
@@ -277,7 +249,7 @@ class WindowsTouchMimicEngine:
             self._cancel_release_timer()
             if self._is_touching:
                 self._emit_touch_up()
-            self._remove_cursor_clip()
+            self._last_cursor_pt = None
 
             # Detach hook on worker thread
             if self._thread_id:
@@ -328,7 +300,7 @@ class WindowsTouchMimicEngine:
         with self._release_timer_lock:
             if self._release_timer:
                 self._release_timer.cancel()
-            self._release_timer = threading.Timer(0.085, self._on_inactivity_timeout)
+            self._release_timer = threading.Timer(0.12, self._on_inactivity_timeout)
             self._release_timer.daemon = True
             self._release_timer.start()
 
@@ -339,34 +311,26 @@ class WindowsTouchMimicEngine:
                 self._release_timer = None
 
     def _on_inactivity_timeout(self) -> None:
-        """Called when no new touchpad motion has arrived for 85ms (finger lifted)."""
+        """Called when no new touchpad motion has arrived for 120ms (finger lifted)."""
         if self._is_touching:
             self._emit_touch_up()
 
-        # If swipe ended near an edge, reposition back to window center
-        # so next swipe has full travel distance in any direction
-        rx, ry, rw, rh = self._target_rect
+        # If drag ended near an edge, recenter to center so next swipe has full travel
+        rx, ry, rw, rh = self.target_rect
         inset = min(self.top_inset_px, max(0, rh - 50))
-        center_x = rx + max(1, rw) // 2
-        center_y = ry + inset + max(1, rh - inset) // 2
+        eff_w = max(1, rw)
+        eff_h = max(1, rh - inset)
+        center_x = rx + eff_w // 2
+        center_y = ry + inset + eff_h // 2
 
-        pt = wt.POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
-        margin_x = max(25, int(rw * 0.15))
-        margin_y = max(25, int(rh * 0.15))
-
-        if (
-            pt.x <= rx + margin_x
-            or pt.x >= rx + rw - margin_x
-            or pt.y <= ry + inset + margin_y
-            or pt.y >= ry + rh - margin_y
-        ):
+        if self._norm_x < 0.2 or self._norm_x > 0.8 or self._norm_y < 0.2 or self._norm_y > 0.8:
+            self._norm_x = 0.5
+            self._norm_y = 0.5
             user32.SetCursorPos(center_x, center_y)
+            self._last_cursor_pt = (center_x, center_y)
 
         if self.on_touch_update:
-            nx = max(0.0, min(1.0, (center_x - rx) / float(max(1, rw))))
-            ny = max(0.0, min(1.0, (center_y - (ry + inset)) / float(max(1, rh - inset))))
-            self.on_touch_update(nx, ny, False, 0)
+            self.on_touch_update(self._norm_x, self._norm_y, False, 0)
 
     def _win32_loop(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
@@ -417,26 +381,48 @@ class WindowsTouchMimicEngine:
                     self._emit_touch_up()
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # Touchpad motion auto-drags inside the clipped target window
+            # Touchpad motion: convert to 1:1 proportional touch-drag
             if wParam == WM_MOUSEMOVE:
-                if not self._is_touching:
-                    self._emit_touch_down()
+                if self._last_cursor_pt is None:
+                    self._last_cursor_pt = (ms.pt.x, ms.pt.y)
+                    return 1
 
-                self._schedule_release_timer()
+                dx = ms.pt.x - self._last_cursor_pt[0]
+                dy = ms.pt.y - self._last_cursor_pt[1]
 
-                now = time.monotonic()
-                if self.on_touch_update and (now - self._last_radar_emit > 0.033):
-                    self._last_radar_emit = now
-                    rx, ry, rw, rh = self._target_rect
+                if dx != 0 or dy != 0:
+                    rx, ry, rw, rh = self.target_rect
                     inset = min(self.top_inset_px, max(0, rh - 50))
-                    nx = max(0.0, min(1.0, (ms.pt.x - rx) / float(max(1, rw))))
-                    ny = max(0.0, min(1.0, (ms.pt.y - (ry + inset)) / float(max(1, rh - inset))))
-                    self._norm_x = nx
-                    self._norm_y = ny
-                    self.on_touch_update(nx, ny, True, 1)
+                    eff_w = max(1, rw)
+                    eff_h = max(1, rh - inset)
 
-            # Always pass the physical event through to Windows so the cursor moves
-            # smoothly and naturally with native touchpad acceleration
+                    # Dynamic sensitivity: maps full touchpad swipe across the target window
+                    sens = 1.45
+                    self._norm_x = max(0.0, min(1.0, self._norm_x + (dx / eff_w) * sens))
+                    self._norm_y = max(0.0, min(1.0, self._norm_y + (dy / eff_h) * sens))
+
+                    target_px = int(rx + self._norm_x * eff_w)
+                    target_py = int(ry + inset + self._norm_y * eff_h)
+
+                    # Auto-engage touch drag on first contact
+                    if not self._is_touching:
+                        user32.SetCursorPos(target_px, target_py)
+                        self._emit_touch_down()
+                    else:
+                        user32.SetCursorPos(target_px, target_py)
+
+                    # Synchronize last cursor position so the next delta is pure physical motion
+                    self._last_cursor_pt = (target_px, target_py)
+                    self._schedule_release_timer()
+
+                    now = time.monotonic()
+                    if self.on_touch_update and (now - self._last_radar_emit > 0.033):
+                        self._last_radar_emit = now
+                        self.on_touch_update(self._norm_x, self._norm_y, True, 1)
+
+                # Swallow physical move to lock cursor strictly to 1:1 touch position
+                return 1
+
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._mouse_cb = HOOKPROC(low_level_mouse_proc)
