@@ -171,7 +171,6 @@ def grant_windows_permissions() -> Tuple[bool, str]:
 
         ret = shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
         if ret > 32:
-            # Successfully launched elevated process — gracefully exit this un-elevated instance
             sys.exit(0)
         return False, "UAC prompt was cancelled or elevation was declined."
     except Exception as exc:
@@ -214,12 +213,8 @@ def get_windows_foreground_window_rect(
 class WindowsTouchMimicEngine:
     """Robust Windows Precision Touchpad & Touch Injection Engine.
 
-    Guarantees:
-      - Never freezes the system or locks the mouse
-      - Never blocks Task Manager, Taskbar, or TouchMimic controls
-      - Immune to re-entrancy via synthetic event filtering & guard flags
-      - Smooth touch-drag with automatic inactivity release
-      - Emergency ESC key to instantly disengage
+    Directly maps physical touchpad finger movements into 1:1 absolute
+    touch contacts and drags inside the target application window.
     """
 
     def __init__(
@@ -298,11 +293,25 @@ class WindowsTouchMimicEngine:
         if self.active == active:
             return
         self.active = active
-        if not active:
+        if active:
+            # Initialize normalized position to current cursor location inside target window (or center)
+            pt = wt.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            rx, ry, rw, rh = self.target_rect
+            if rx <= pt.x <= rx + rw and ry <= pt.y <= ry + rh:
+                self._norm_x = max(0.0, min(1.0, (pt.x - rx) / max(1, rw)))
+                self._norm_y = max(0.0, min(1.0, (pt.y - ry) / max(1, rh)))
+            else:
+                self._norm_x = 0.5
+                self._norm_y = 0.5
+            self._last_physical_pt = None
+            self._is_touching = False
+        else:
             self._cancel_release_timer()
             if self._is_touching:
                 self._emit_touch_up()
             self._last_physical_pt = None
+
         if self.on_state_changed:
             self.on_state_changed(self.active)
 
@@ -329,9 +338,9 @@ class WindowsTouchMimicEngine:
         )
 
     def _is_safe_window_under_cursor(self, pt: wt.POINT) -> bool:
-        """Return True if cursor is over TouchMimic, Taskbar, or Task Manager.
+        """Return True only if cursor is over TouchMimic, Taskbar, or Task Manager.
 
-        Never intercept input when interacting with system controls or TouchMimic!
+        Used to ensure the user can always click TouchMimic buttons, taskbar, or Task Manager.
         """
         try:
             hwnd = user32.WindowFromPoint(pt)
@@ -348,9 +357,7 @@ class WindowsTouchMimicEngine:
                 "shell_traywnd",
                 "shell_secondarytraywnd",
                 "dv2controlhost",
-                "windows.ui.core.corewindow",
-                "progman",
-                "workerw",
+                "taskmgr",
             ):
                 return True
 
@@ -359,7 +366,7 @@ class WindowsTouchMimicEngine:
             user32.GetWindowTextW(target_hwnd, title_buf, title_len + 1)
             title = title_buf.value.lower()
 
-            if "touchmimic" in title or "task manager" in title or "taskmgr" in cls_name:
+            if "touchmimic" in title or "task manager" in title:
                 return True
         except Exception:
             pass
@@ -369,49 +376,13 @@ class WindowsTouchMimicEngine:
         if not IS_WINDOWS:
             return False
 
-        if self.emulation_mode == "native_touch" and self._touch_initialized:
-            ti = POINTER_TOUCH_INFO()
-            ti.pointerInfo.pointerType = PT_TOUCH
-            ti.pointerInfo.pointerId = 0
-            ti.pointerInfo.ptPixelLocation.x = px
-            ti.pointerInfo.ptPixelLocation.y = py
-            ti.pointerInfo.pointerFlags = (
-                POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
-            )
-            ti.touchMask = (
-                TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE
-            )
-            ti.rcContact.left = px - 2
-            ti.rcContact.top = py - 2
-            ti.rcContact.right = px + 2
-            ti.rcContact.bottom = py + 2
-            ti.orientation = 90
-            ti.pressure = 32000
-            self._is_injecting = True
-            try:
-                return bool(user32.InjectTouchInput(1, ctypes.byref(ti)))
-            finally:
-                self._is_injecting = False
-
-        # Universal pointer drag
-        abs_x = int((px / max(1, self.screen_width)) * 65535)
-        abs_y = int((py / max(1, self.screen_height)) * 65535)
-        inp = INPUT()
-        inp.type = INPUT_MOUSE
-        inp.u.mi.dx = abs_x
-        inp.u.mi.dy = abs_y
-        inp.u.mi.dwFlags = (
-            MOUSEEVENTF_MOVE
-            | MOUSEEVENTF_ABSOLUTE
-            | MOUSEEVENTF_VIRTUALDESK
-            | MOUSEEVENTF_LEFTDOWN
-        )
-        inp.u.mi.dwExtraInfo = SYNTHETIC_MARKER
-
         self._is_injecting = True
         try:
-            res = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-            return res > 0
+            user32.SetCursorPos(px, py)
+            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, SYNTHETIC_MARKER)
+            return True
+        except Exception:
+            return False
         finally:
             self._is_injecting = False
 
@@ -419,86 +390,28 @@ class WindowsTouchMimicEngine:
         if not IS_WINDOWS:
             return False
 
-        if self.emulation_mode == "native_touch" and self._touch_initialized:
-            ti = POINTER_TOUCH_INFO()
-            ti.pointerInfo.pointerType = PT_TOUCH
-            ti.pointerInfo.pointerId = 0
-            ti.pointerInfo.ptPixelLocation.x = px
-            ti.pointerInfo.ptPixelLocation.y = py
-            ti.pointerInfo.pointerFlags = (
-                POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
-            )
-            ti.touchMask = (
-                TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE
-            )
-            ti.rcContact.left = px - 2
-            ti.rcContact.top = py - 2
-            ti.rcContact.right = px + 2
-            ti.rcContact.bottom = py + 2
-            ti.orientation = 90
-            ti.pressure = 32000
-            self._is_injecting = True
-            try:
-                return bool(user32.InjectTouchInput(1, ctypes.byref(ti)))
-            finally:
-                self._is_injecting = False
-
-        abs_x = int((px / max(1, self.screen_width)) * 65535)
-        abs_y = int((py / max(1, self.screen_height)) * 65535)
-        inp = INPUT()
-        inp.type = INPUT_MOUSE
-        inp.u.mi.dx = abs_x
-        inp.u.mi.dy = abs_y
-        inp.u.mi.dwFlags = (
-            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-        )
-        inp.u.mi.dwExtraInfo = SYNTHETIC_MARKER
-
         self._is_injecting = True
         try:
-            res = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-            return res > 0
+            user32.SetCursorPos(px, py)
+            user32.mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, SYNTHETIC_MARKER)
+            return True
+        except Exception:
+            return False
         finally:
             self._is_injecting = False
 
     def _emit_touch_up(self) -> None:
-        if not IS_WINDOWS or not self._is_touching:
+        if not IS_WINDOWS:
             return
-        px, py = self._map_to_screen_px(self._norm_x, self._norm_y)
 
-        if self.emulation_mode == "native_touch" and self._touch_initialized:
-            ti = POINTER_TOUCH_INFO()
-            ti.pointerInfo.pointerType = PT_TOUCH
-            ti.pointerInfo.pointerId = 0
-            ti.pointerInfo.ptPixelLocation.x = px
-            ti.pointerInfo.ptPixelLocation.y = py
-            ti.pointerInfo.pointerFlags = POINTER_FLAG_UP
-            self._is_injecting = True
-            try:
-                user32.InjectTouchInput(1, ctypes.byref(ti))
-            finally:
-                self._is_injecting = False
-                self._is_touching = False
-        else:
-            abs_x = int((px / max(1, self.screen_width)) * 65535)
-            abs_y = int((py / max(1, self.screen_height)) * 65535)
-            inp = INPUT()
-            inp.type = INPUT_MOUSE
-            inp.u.mi.dx = abs_x
-            inp.u.mi.dy = abs_y
-            inp.u.mi.dwFlags = (
-                MOUSEEVENTF_MOVE
-                | MOUSEEVENTF_ABSOLUTE
-                | MOUSEEVENTF_VIRTUALDESK
-                | MOUSEEVENTF_LEFTUP
-            )
-            inp.u.mi.dwExtraInfo = SYNTHETIC_MARKER
-            self._is_injecting = True
-            try:
-                user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-            finally:
-                self._is_injecting = False
-                self._is_touching = False
+        self._is_injecting = True
+        try:
+            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, SYNTHETIC_MARKER)
+        except Exception:
+            pass
+        finally:
+            self._is_injecting = False
+            self._is_touching = False
 
         if self.on_touch_update:
             self.on_touch_update(self._norm_x, self._norm_y, False, 0)
@@ -565,22 +478,24 @@ class WindowsTouchMimicEngine:
                 if ms.dwExtraInfo == SYNTHETIC_MARKER:
                     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-                # 2. Never intercept input over TouchMimic, Taskbar, or Task Manager
-                if self._is_safe_window_under_cursor(ms.pt):
-                    if self._is_touching:
-                        self._emit_touch_up()
-                    self._last_physical_pt = None
-                    return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-                # 3. Touchpad motion tracking
+                # 2. Touch Mode Active Handling
                 if self.active:
-                    # Physical clicks always pass through or release touch
-                    if wParam in (WM_LBUTTONUP, WM_RBUTTONDOWN, WM_MBUTTONDOWN):
+                    # Allow physical clicks on TouchMimic, Taskbar, or Task Manager to pass through
+                    if wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN):
+                        if self._is_safe_window_under_cursor(ms.pt):
+                            if self._is_touching:
+                                self._emit_touch_up()
+                            self._last_physical_pt = None
+                            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+                    # Physical button up releases touch
+                    if wParam in (WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP):
                         if self._is_touching:
                             self._emit_touch_up()
                         self._last_physical_pt = None
                         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+                    # Track physical touchpad displacement
                     if self._last_physical_pt is None:
                         self._last_physical_pt = (ms.pt.x, ms.pt.y)
                         dx = 0
@@ -590,38 +505,32 @@ class WindowsTouchMimicEngine:
                         dy = ms.pt.y - self._last_physical_pt[1]
                         self._last_physical_pt = (ms.pt.x, ms.pt.y)
 
-                    # Update proportional position within target window bounds
-                    step_x = dx / max(1, self.screen_width)
-                    step_y = dy / max(1, self.screen_height)
-                    self._norm_x = min(1.0, max(0.0, self._norm_x + step_x))
-                    self._norm_y = min(1.0, max(0.0, self._norm_y + step_y))
+                    if dx != 0 or dy != 0:
+                        rx, ry, rw, rh = self.target_rect
+                        sens = 1.3
+                        self._norm_x = min(1.0, max(0.0, self._norm_x + (dx / max(1, rw)) * sens))
+                        self._norm_y = min(1.0, max(0.0, self._norm_y + (dy / max(1, rh)) * sens))
 
-                    px, py = self._map_to_screen_px(self._norm_x, self._norm_y)
+                        px, py = self._map_to_screen_px(self._norm_x, self._norm_y)
 
-                    # Touch lifecycle: Start touch down or continue drag
-                    success = False
-                    if not self._is_touching:
-                        success = self._emit_touch_down(px, py)
-                        if success:
+                        if not self._is_touching:
+                            self._emit_touch_down(px, py)
                             self._is_touching = True
-                    else:
-                        success = self._emit_touch_move(px, py)
+                        else:
+                            self._emit_touch_move(px, py)
 
-                    self._schedule_release_timer()
+                        self._schedule_release_timer()
 
-                    # Throttle UI radar update to at most ~30 FPS
-                    now = time.monotonic()
-                    if self.on_touch_update and (now - self._last_radar_emit > 0.033):
-                        self._last_radar_emit = now
-                        self.on_touch_update(
-                            self._norm_x, self._norm_y, self._is_touching, 1
-                        )
+                        # Throttle UI radar update to ~30 FPS
+                        now = time.monotonic()
+                        if self.on_touch_update and (now - self._last_radar_emit > 0.033):
+                            self._last_radar_emit = now
+                            self.on_touch_update(
+                                self._norm_x, self._norm_y, True, 1
+                            )
 
-                    # If injection succeeded, swallow the physical event;
-                    # If injection was denied (e.g. no admin), DO NOT swallow to prevent freezing!
-                    if success:
-                        return 1
-                    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+                    # Intercept physical movement so cursor stays locked inside target window
+                    return 1
                 else:
                     self._last_physical_pt = (ms.pt.x, ms.pt.y)
                     self._norm_x = max(0.0, min(1.0, ms.pt.x / max(1, self.screen_width)))
