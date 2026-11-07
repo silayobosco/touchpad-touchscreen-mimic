@@ -25,7 +25,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
         pass
 
 PROJECT_ROOT = os.path.dirname(os.path.realpath(__file__))
-ENTRY_POINT = os.path.join(PROJECT_ROOT, "touchmimic", "__main__.py")
+ENTRY_POINT = os.path.join(PROJECT_ROOT, "run_touchmimic.py")
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
 
