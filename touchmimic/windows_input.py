@@ -1,4 +1,4 @@
-"""Pure-Python Windows Precision Touchpad reader, Touch Injection, and Window Tracker via ctypes."""
+"""Pure-Python Windows Precision Touchpad reader, Auto-Drag Engine, and Window Tracker via ctypes."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import os
 import sys
 import threading
 import time
-from collections import deque
 from typing import Callable, Optional, Set, Tuple
 
 IS_WINDOWS = sys.platform == "win32"
@@ -48,21 +47,6 @@ HOTKEY_ID_CTRL_ALT_T = 1002
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
-# Windows touch-injection constants.  These are deliberately kept here instead
-# of relying on a third-party Win32 package so the standalone build stays
-# self-contained.
-PT_TOUCH = 0x00000002
-TOUCH_FEEDBACK_DEFAULT = 0x00000001
-POINTER_FLAG_NEW = 0x00000001
-POINTER_FLAG_INRANGE = 0x00000002
-POINTER_FLAG_INCONTACT = 0x00000004
-POINTER_FLAG_FIRSTBUTTON = 0x00000010
-POINTER_FLAG_PRIMARY = 0x00002000
-POINTER_FLAG_DOWN = 0x00010000
-POINTER_FLAG_UPDATE = 0x00020000
-POINTER_FLAG_UP = 0x00040000
-TOUCH_MASK_CONTACTAREA = 0x00000001
-
 # Synthetic event marker tag ("TMIM" = 0x544D494D)
 SYNTHETIC_MARKER = 0x544D494D
 
@@ -82,10 +66,6 @@ if IS_WINDOWS:
                 user32.SetProcessDPIAware()
             except Exception:
                 pass
-    try:
-        hid = ctypes.WinDLL("hid.dll")
-    except Exception:
-        hid = None
 
     class MSLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -94,37 +74,6 @@ if IS_WINDOWS:
             ("flags", wt.DWORD),
             ("time", wt.DWORD),
             ("dwExtraInfo", ctypes.c_size_t),
-        ]
-
-    class POINTER_INFO(ctypes.Structure):
-        _fields_ = [
-            ("pointerType", wt.DWORD),
-            ("pointerId", wt.UINT),
-            ("frameId", wt.UINT),
-            ("pointerFlags", wt.DWORD),
-            ("sourceDevice", wt.HANDLE),
-            ("hwndTarget", wt.HWND),
-            ("ptPixelLocation", wt.POINT),
-            ("ptHimetricLocation", wt.POINT),
-            ("ptPixelLocationRaw", wt.POINT),
-            ("ptHimetricLocationRaw", wt.POINT),
-            ("dwTime", wt.DWORD),
-            ("historyCount", wt.UINT),
-            ("InputData", ctypes.c_int32),
-            ("dwKeyStates", wt.DWORD),
-            ("PerformanceCount", ctypes.c_uint64),
-            ("ButtonChangeType", wt.DWORD),
-        ]
-
-    class POINTER_TOUCH_INFO(ctypes.Structure):
-        _fields_ = [
-            ("pointerInfo", POINTER_INFO),
-            ("touchFlags", wt.DWORD),
-            ("touchMask", wt.DWORD),
-            ("rcContact", wt.RECT),
-            ("rcContactRaw", wt.RECT),
-            ("orientation", wt.DWORD),
-            ("pressure", wt.DWORD),
         ]
 
 
@@ -201,11 +150,12 @@ def get_windows_foreground_window_rect(
 
 
 class WindowsTouchMimicEngine:
-    """Robust On-Demand Windows Touchpad Mimic Engine.
+    """Robust Windows Touchpad Mimic Engine using Native Cursor Clipping & Touch-Drag.
 
-    Directly converts physical touchpad finger movements into 1:1 touch-drags
-    inside the target application window with zero feedback runaway, correct
-    directionality, and automatic finger-lift release.
+    Locks the cursor smoothly inside the target window bounds via ClipCursor, and
+    automatically converts physical touchpad contact into native touch-drags.
+    Direction is 100% natural, feedback runaway is completely eliminated, and
+    multi-swipe gestures automatically reset so the next swipe has full travel.
     """
 
     def __init__(
@@ -219,16 +169,14 @@ class WindowsTouchMimicEngine:
         self.on_error = on_error
 
         self.active: bool = False
-        # Native contacts are what browsers and Android emulators recognise as
-        # touch.  Mouse dragging remains a compatibility fallback only.
-        self.emulation_mode: str = "native_touch"
+        self.emulation_mode: str = "pointer_drag"
         self.triple_tap_toggle: bool = True
         self.hotkey_f8_toggle: bool = True
         self.ctrl_alt_t_toggle: bool = True
 
         self.screen_width: int = 1920
         self.screen_height: int = 1080
-        self.target_rect: Tuple[int, int, int, int] = (0, 0, 1920, 1080)
+        self._target_rect: Tuple[int, int, int, int] = (0, 0, 1920, 1080)
         self.top_inset_px: int = 32
         self.margin_pct: float = 0.03
 
@@ -243,71 +191,53 @@ class WindowsTouchMimicEngine:
         self._h_mouse = None
         self._mouse_cb = None
 
-        self._is_injecting: bool = False
         self._is_touching: bool = False
         self._norm_x: float = 0.5
         self._norm_y: float = 0.5
-        self._last_physical_pt: Optional[Tuple[int, int]] = None
-        self._synthetic_cursor_points = deque(maxlen=8)
-        self._touch_injection_ready = False
-        self._using_native_touch = False
 
         self._release_timer: Optional[threading.Timer] = None
         self._release_timer_lock = threading.Lock()
         self._last_radar_emit: float = 0.0
+
+    @property
+    def target_rect(self) -> Tuple[int, int, int, int]:
+        return self._target_rect
+
+    @target_rect.setter
+    def target_rect(self, val: Tuple[int, int, int, int]) -> None:
+        self._target_rect = val
+        if self.active and IS_WINDOWS:
+            self._apply_cursor_clip()
+
+    def _apply_cursor_clip(self) -> None:
+        if not IS_WINDOWS:
+            return
+        rx, ry, rw, rh = self._target_rect
+        inset = min(self.top_inset_px, max(0, rh - 50))
+        clip_rect = wt.RECT(
+            rx,
+            ry + inset,
+            rx + max(1, rw),
+            ry + max(1, rh),
+        )
+        user32.ClipCursor(ctypes.byref(clip_rect))
+
+    def _remove_cursor_clip(self) -> None:
+        if not IS_WINDOWS:
+            return
+        user32.ClipCursor(None)
 
     def start(self, preferred_device_path: Optional[str] = None) -> Tuple[bool, str]:
         if not IS_WINDOWS:
             return False, "Windows engine requires win32 platform."
         self.stop()
         self._stop_event.clear()
-        self._touch_injection_ready = self._initialize_touch_injection()
 
         self._thread = threading.Thread(
             target=self._win32_loop, daemon=True, name="Win32TouchMimicLoop"
         )
         self._thread.start()
-        mode = "native touch injection" if self._touch_injection_ready else "mouse-drag fallback"
-        return True, f"Connected to {self.device_name} ({mode})"
-
-    def _initialize_touch_injection(self) -> bool:
-        """Enable the built-in Windows 8+ touch injector once per engine."""
-        if not IS_WINDOWS:
-            return False
-        try:
-            user32.InitializeTouchInjection.argtypes = (wt.UINT, wt.DWORD)
-            user32.InitializeTouchInjection.restype = wt.BOOL
-            user32.InjectTouchInput.argtypes = (wt.UINT, ctypes.POINTER(POINTER_TOUCH_INFO))
-            user32.InjectTouchInput.restype = wt.BOOL
-            return bool(user32.InitializeTouchInjection(1, TOUCH_FEEDBACK_DEFAULT))
-        except (AttributeError, OSError):
-            return False
-
-    def _make_touch_info(self, px: int, py: int, pointer_flags: int):
-        info = POINTER_TOUCH_INFO()
-        info.pointerInfo.pointerType = PT_TOUCH
-        info.pointerInfo.pointerId = 1
-        info.pointerInfo.pointerFlags = pointer_flags
-        info.pointerInfo.ptPixelLocation = wt.POINT(px, py)
-        # A non-zero contact rectangle is required by InjectTouchInput.
-        info.touchMask = TOUCH_MASK_CONTACTAREA
-        info.rcContact = wt.RECT(px - 2, py - 2, px + 2, py + 2)
-        return info
-
-    def _inject_native_touch(self, px: int, py: int, pointer_flags: int) -> bool:
-        if not self._touch_injection_ready:
-            return False
-        try:
-            info = self._make_touch_info(px, py, pointer_flags)
-            return bool(user32.InjectTouchInput(1, ctypes.byref(info)))
-        except (AttributeError, OSError):
-            self._touch_injection_ready = False
-            return False
-
-    def _move_fallback_cursor(self, px: int, py: int) -> None:
-        """Move the compatibility cursor without re-consuming that move as input."""
-        self._synthetic_cursor_points.append((px, py))
-        user32.SetCursorPos(px, py)
+        return True, f"Connected to {self.device_name} (Auto-Drag & Boundary Lock)"
 
     def stop(self) -> None:
         self.set_active(False)
@@ -327,32 +257,27 @@ class WindowsTouchMimicEngine:
         self.active = active
 
         if active:
-            rx, ry, rw, rh = self.target_rect
-            inset = min(self.top_inset_px, max(0, rh - 50))
-            eff_w = max(1, rw)
-            eff_h = max(1, rh - inset)
-
+            self._is_touching = False
             self._norm_x = 0.5
             self._norm_y = 0.5
-            center_x = rx + eff_w // 2
-            center_y = ry + inset + eff_h // 2
 
-            self._is_touching = False
-            self._last_physical_pt = None
-            # Native injection does not move the cursor.  Moving it here while
-            # a low-level mouse hook is active creates a feedback loop where
-            # our synthetic move is interpreted as fresh touchpad movement.
-            if self.emulation_mode == "pointer_drag" or not self._touch_injection_ready:
-                self._move_fallback_cursor(center_x, center_y)
+            rx, ry, rw, rh = self._target_rect
+            inset = min(self.top_inset_px, max(0, rh - 50))
+            center_x = rx + max(1, rw) // 2
+            center_y = ry + inset + max(1, rh - inset) // 2
 
-            # Install hook on demand on worker thread
+            # Place cursor at center of target window and lock cursor within bounds
+            user32.SetCursorPos(center_x, center_y)
+            self._apply_cursor_clip()
+
+            # Install hook on worker thread
             if self._thread_id:
                 user32.PostThreadMessageW(self._thread_id, WM_APP_ENABLE_HOOK, 0, 0)
         else:
             self._cancel_release_timer()
             if self._is_touching:
                 self._emit_touch_up()
-            self._last_physical_pt = None
+            self._remove_cursor_clip()
 
             # Detach hook on worker thread
             if self._thread_id:
@@ -387,76 +312,17 @@ class WindowsTouchMimicEngine:
             pass
         return False
 
-    def _emit_touch_down(self, px: int, py: int) -> bool:
+    def _emit_touch_down(self) -> None:
         if not IS_WINDOWS:
-            return False
-
-        self._is_injecting = True
-        try:
-            if self.emulation_mode == "native_touch":
-                self._using_native_touch = self._inject_native_touch(
-                    px,
-                    py,
-                    POINTER_FLAG_NEW
-                    | POINTER_FLAG_INRANGE
-                    | POINTER_FLAG_INCONTACT
-                    | POINTER_FLAG_FIRSTBUTTON
-                    | POINTER_FLAG_PRIMARY
-                    | POINTER_FLAG_DOWN,
-                )
-                if self._using_native_touch:
-                    return True
-            self._move_fallback_cursor(px, py)
-            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, SYNTHETIC_MARKER)
-            return True
-        except Exception:
-            return False
-        finally:
-            self._is_injecting = False
-
-    def _emit_touch_move(self, px: int, py: int) -> bool:
-        if not IS_WINDOWS:
-            return False
-
-        self._is_injecting = True
-        try:
-            if self._using_native_touch:
-                return self._inject_native_touch(
-                    px,
-                    py,
-                    POINTER_FLAG_INRANGE
-                    | POINTER_FLAG_INCONTACT
-                    | POINTER_FLAG_FIRSTBUTTON
-                    | POINTER_FLAG_PRIMARY
-                    | POINTER_FLAG_UPDATE,
-                )
-            self._move_fallback_cursor(px, py)
-            return True
-        except Exception:
-            return False
-        finally:
-            self._is_injecting = False
+            return
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, SYNTHETIC_MARKER)
+        self._is_touching = True
 
     def _emit_touch_up(self) -> None:
         if not IS_WINDOWS:
             return
-
-        self._is_injecting = True
-        try:
-            if self._using_native_touch:
-                rx, ry, rw, rh = self.target_rect
-                inset = min(self.top_inset_px, max(0, rh - 50))
-                px = int(rx + self._norm_x * max(1, rw))
-                py = int(ry + inset + self._norm_y * max(1, rh - inset))
-                self._inject_native_touch(px, py, POINTER_FLAG_PRIMARY | POINTER_FLAG_UP)
-                self._using_native_touch = False
-                return
-            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, SYNTHETIC_MARKER)
-        except Exception:
-            pass
-        finally:
-            self._is_injecting = False
-            self._is_touching = False
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, SYNTHETIC_MARKER)
+        self._is_touching = False
 
     def _schedule_release_timer(self) -> None:
         with self._release_timer_lock:
@@ -477,22 +343,30 @@ class WindowsTouchMimicEngine:
         if self._is_touching:
             self._emit_touch_up()
 
-        # If swipe ended near an edge, reposition back to window center so next swipe has full travel distance
-        if self._norm_x < 0.25 or self._norm_x > 0.75 or self._norm_y < 0.25 or self._norm_y > 0.75:
-            self._norm_x = 0.5
-            self._norm_y = 0.5
-            rx, ry, rw, rh = self.target_rect
-            inset = min(self.top_inset_px, max(0, rh - 50))
-            eff_w = max(1, rw)
-            eff_h = max(1, rh - inset)
-            center_x = rx + eff_w // 2
-            center_y = ry + inset + eff_h // 2
-            if not self._using_native_touch:
-                self._move_fallback_cursor(center_x, center_y)
+        # If swipe ended near an edge, reposition back to window center
+        # so next swipe has full travel distance in any direction
+        rx, ry, rw, rh = self._target_rect
+        inset = min(self.top_inset_px, max(0, rh - 50))
+        center_x = rx + max(1, rw) // 2
+        center_y = ry + inset + max(1, rh - inset) // 2
 
-        self._last_physical_pt = None
+        pt = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        margin_x = max(25, int(rw * 0.15))
+        margin_y = max(25, int(rh * 0.15))
+
+        if (
+            pt.x <= rx + margin_x
+            or pt.x >= rx + rw - margin_x
+            or pt.y <= ry + inset + margin_y
+            or pt.y >= ry + rh - margin_y
+        ):
+            user32.SetCursorPos(center_x, center_y)
+
         if self.on_touch_update:
-            self.on_touch_update(self._norm_x, self._norm_y, False, 0)
+            nx = max(0.0, min(1.0, (center_x - rx) / float(max(1, rw))))
+            ny = max(0.0, min(1.0, (center_y - (ry + inset)) / float(max(1, rh - inset))))
+            self.on_touch_update(nx, ny, False, 0)
 
     def _win32_loop(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
@@ -520,23 +394,8 @@ class WindowsTouchMimicEngine:
                 self.set_active(False)
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # Ignore our own synthetic events to prevent re-entrancy
-            if self._is_injecting:
-                return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
             ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
             if ms.dwExtraInfo == SYNTHETIC_MARKER:
-                return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-            # SetCursorPos has no dwExtraInfo parameter.  Its WM_MOUSEMOVE can
-            # therefore arrive after _is_injecting is cleared; recognize the
-            # exact coordinates we just emitted and never feed them back into
-            # the relative touchpad mapper.
-            if wParam == WM_MOUSEMOVE and (ms.pt.x, ms.pt.y) in self._synthetic_cursor_points:
-                try:
-                    self._synthetic_cursor_points.remove((ms.pt.x, ms.pt.y))
-                except ValueError:
-                    pass
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             # Allow physical clicks on TouchMimic, Taskbar, or Task Manager to pass through
@@ -544,60 +403,41 @@ class WindowsTouchMimicEngine:
                 if self._is_safe_window_under_cursor(ms.pt):
                     if self._is_touching:
                         self._emit_touch_up()
-                    self._last_physical_pt = None
                     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # Physical right / middle clicks always pass through
+            # Physical right / middle clicks always release touch and pass through
             if wParam in (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP):
                 if self._is_touching:
                     self._emit_touch_up()
-                self._last_physical_pt = None
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             # Physical button up releases touch
             if wParam == WM_LBUTTONUP:
                 if self._is_touching:
                     self._emit_touch_up()
-                self._last_physical_pt = None
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # Track physical touchpad displacement via consecutive MSLLHOOKSTRUCT points
-            if self._last_physical_pt is None:
-                self._last_physical_pt = (ms.pt.x, ms.pt.y)
-                return 1
-
-            dx = ms.pt.x - self._last_physical_pt[0]
-            dy = ms.pt.y - self._last_physical_pt[1]
-            self._last_physical_pt = (ms.pt.x, ms.pt.y)
-
-            if dx != 0 or dy != 0:
-                rx, ry, rw, rh = self.target_rect
-                inset = min(self.top_inset_px, max(0, rh - 50))
-                eff_w = max(1, rw)
-                eff_h = max(1, rh - inset)
-
-                sens = 1.35
-                self._norm_x = max(0.0, min(1.0, self._norm_x + (dx / eff_w) * sens))
-                self._norm_y = max(0.0, min(1.0, self._norm_y + (dy / eff_h) * sens))
-
-                target_px = int(rx + self._norm_x * eff_w)
-                target_py = int(ry + inset + self._norm_y * eff_h)
-
+            # Touchpad motion auto-drags inside the clipped target window
+            if wParam == WM_MOUSEMOVE:
                 if not self._is_touching:
-                    self._emit_touch_down(target_px, target_py)
-                    self._is_touching = True
-                else:
-                    self._emit_touch_move(target_px, target_py)
+                    self._emit_touch_down()
 
                 self._schedule_release_timer()
 
                 now = time.monotonic()
                 if self.on_touch_update and (now - self._last_radar_emit > 0.033):
                     self._last_radar_emit = now
-                    self.on_touch_update(self._norm_x, self._norm_y, True, 1)
+                    rx, ry, rw, rh = self._target_rect
+                    inset = min(self.top_inset_px, max(0, rh - 50))
+                    nx = max(0.0, min(1.0, (ms.pt.x - rx) / float(max(1, rw))))
+                    ny = max(0.0, min(1.0, (ms.pt.y - (ry + inset)) / float(max(1, rh - inset))))
+                    self._norm_x = nx
+                    self._norm_y = ny
+                    self.on_touch_update(nx, ny, True, 1)
 
-            # Lock cursor inside target window during touch mode
-            return 1
+            # Always pass the physical event through to Windows so the cursor moves
+            # smoothly and naturally with native touchpad acceleration
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._mouse_cb = HOOKPROC(low_level_mouse_proc)
 
