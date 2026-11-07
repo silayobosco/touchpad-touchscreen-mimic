@@ -42,7 +42,8 @@ def grant_platform_permissions() -> Tuple[bool, str]:
         from .linux_input import grant_permissions_via_pkexec
         return grant_permissions_via_pkexec(install_udev=True)
     if os_name == "windows":
-        return True, "Windows Touch Injection requires no elevated permissions."
+        from .windows_input import grant_windows_permissions
+        return grant_windows_permissions()
     if os_name == "macos":
         from .macos_input import prompt_macos_accessibility_permissions
         return prompt_macos_accessibility_permissions()

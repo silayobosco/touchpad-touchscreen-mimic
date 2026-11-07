@@ -619,7 +619,11 @@ class TouchMimicController(QMainWindow):
         ok, msg = check_platform_permissions()
         if not ok:
             self.perm_frame.setVisible(True)
+            self.perm_label.setText(f"⚠️ {msg}")
             self.device_label.setText(f"Status: {msg}")
+            if get_os_name() == "windows":
+                self.engine.start()
+                self._sync_target_to_engine(self.tracker.current_target())
             return
         self.perm_frame.setVisible(False)
         started, status_msg = self.engine.start()
