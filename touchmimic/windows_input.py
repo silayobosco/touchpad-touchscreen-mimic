@@ -56,6 +56,17 @@ if IS_WINDOWS:
     kernel32 = ctypes.windll.kernel32
     shell32 = ctypes.windll.shell32
     try:
+        # Enable Per-Monitor DPI Awareness V2 so coordinate metrics are unscaled
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    try:
         hid = ctypes.WinDLL("hid.dll")
     except Exception:
         hid = None
@@ -185,7 +196,9 @@ class WindowsTouchMimicEngine:
 
         self._is_injecting: bool = False
         self._is_touching: bool = False
-        self._current_pos: Optional[Tuple[int, int]] = None
+        self._norm_x: float = 0.5
+        self._norm_y: float = 0.5
+        self._last_physical_pt: Optional[Tuple[int, int]] = None
 
         self._release_timer: Optional[threading.Timer] = None
         self._release_timer_lock = threading.Lock()
@@ -223,25 +236,17 @@ class WindowsTouchMimicEngine:
         if active:
             rx, ry, rw, rh = self.target_rect
             inset = min(self.top_inset_px, max(0, rh - 50))
-            min_x = rx
-            max_x = rx + max(1, rw) - 1
-            min_y = ry + inset
-            max_y = ry + max(1, rh - inset)
+            eff_w = max(1, rw)
+            eff_h = max(1, rh - inset)
 
-            pt = wt.POINT()
-            user32.GetCursorPos(ctypes.byref(pt))
-
-            # If cursor is already inside the target window, start there; otherwise start at center
-            if min_x <= pt.x <= max_x and min_y <= pt.y <= max_y:
-                self._current_pos = (pt.x, pt.y)
-            else:
-                self._current_pos = (
-                    rx + max(1, rw) // 2,
-                    ry + inset + max(1, rh - inset) // 2,
-                )
+            self._norm_x = 0.5
+            self._norm_y = 0.5
+            center_x = rx + eff_w // 2
+            center_y = ry + inset + eff_h // 2
 
             self._is_touching = False
-            user32.SetCursorPos(self._current_pos[0], self._current_pos[1])
+            self._last_physical_pt = None
+            user32.SetCursorPos(center_x, center_y)
 
             # Install hook on demand on worker thread
             if self._thread_id:
@@ -250,7 +255,7 @@ class WindowsTouchMimicEngine:
             self._cancel_release_timer()
             if self._is_touching:
                 self._emit_touch_up()
-            self._current_pos = None
+            self._last_physical_pt = None
 
             # Detach hook on worker thread
             if self._thread_id:
@@ -345,15 +350,20 @@ class WindowsTouchMimicEngine:
             self._emit_touch_up()
 
         # If swipe ended near an edge, reposition back to window center so next swipe has full travel distance
-        rx, ry, rw, rh = self.target_rect
-        if self._current_pos is not None:
-            cx, cy = self._current_pos
+        if self._norm_x < 0.25 or self._norm_x > 0.75 or self._norm_y < 0.25 or self._norm_y > 0.75:
+            self._norm_x = 0.5
+            self._norm_y = 0.5
+            rx, ry, rw, rh = self.target_rect
             inset = min(self.top_inset_px, max(0, rh - 50))
-            if cx <= rx + 25 or cx >= rx + rw - 25 or cy <= ry + inset + 25 or cy >= ry + rh - 25:
-                center_x = rx + max(1, rw) // 2
-                center_y = ry + inset + max(1, rh - inset) // 2
-                self._current_pos = (center_x, center_y)
-                user32.SetCursorPos(center_x, center_y)
+            eff_w = max(1, rw)
+            eff_h = max(1, rh - inset)
+            center_x = rx + eff_w // 2
+            center_y = ry + inset + eff_h // 2
+            user32.SetCursorPos(center_x, center_y)
+
+        self._last_physical_pt = None
+        if self.on_touch_update:
+            self.on_touch_update(self._norm_x, self._norm_y, False, 0)
 
     def _win32_loop(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
@@ -394,52 +404,57 @@ class WindowsTouchMimicEngine:
                 if self._is_safe_window_under_cursor(ms.pt):
                     if self._is_touching:
                         self._emit_touch_up()
+                    self._last_physical_pt = None
                     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # Physical button up releases touch
-            if wParam in (WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP):
+            # Physical right / middle clicks always pass through
+            if wParam in (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP):
                 if self._is_touching:
                     self._emit_touch_up()
+                self._last_physical_pt = None
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            # Target window clamping bounds
-            rx, ry, rw, rh = self.target_rect
-            inset = min(self.top_inset_px, max(0, rh - 50))
-            min_x = rx
-            max_x = rx + max(1, rw) - 1
-            min_y = ry + inset
-            max_y = ry + max(1, rh - inset)
+            # Physical button up releases touch
+            if wParam == WM_LBUTTONUP:
+                if self._is_touching:
+                    self._emit_touch_up()
+                self._last_physical_pt = None
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-            if self._current_pos is None:
-                self._current_pos = (
-                    rx + max(1, rw) // 2,
-                    ry + inset + max(1, rh - inset) // 2,
-                )
-                user32.SetCursorPos(self._current_pos[0], self._current_pos[1])
+            # Track physical touchpad displacement via consecutive MSLLHOOKSTRUCT points
+            if self._last_physical_pt is None:
+                self._last_physical_pt = (ms.pt.x, ms.pt.y)
+                return 1
 
-            # Calculate true physical displacement from previous position
-            dx = ms.pt.x - self._current_pos[0]
-            dy = ms.pt.y - self._current_pos[1]
+            dx = ms.pt.x - self._last_physical_pt[0]
+            dy = ms.pt.y - self._last_physical_pt[1]
+            self._last_physical_pt = (ms.pt.x, ms.pt.y)
 
             if dx != 0 or dy != 0:
-                new_x = max(min_x, min(max_x, self._current_pos[0] + dx))
-                new_y = max(min_y, min(max_y, self._current_pos[1] + dy))
+                rx, ry, rw, rh = self.target_rect
+                inset = min(self.top_inset_px, max(0, rh - 50))
+                eff_w = max(1, rw)
+                eff_h = max(1, rh - inset)
+
+                sens = 1.35
+                self._norm_x = max(0.0, min(1.0, self._norm_x + (dx / eff_w) * sens))
+                self._norm_y = max(0.0, min(1.0, self._norm_y + (dy / eff_h) * sens))
+
+                target_px = int(rx + self._norm_x * eff_w)
+                target_py = int(ry + inset + self._norm_y * eff_h)
 
                 if not self._is_touching:
-                    self._emit_touch_down(new_x, new_y)
+                    self._emit_touch_down(target_px, target_py)
                     self._is_touching = True
                 else:
-                    self._emit_touch_move(new_x, new_y)
+                    self._emit_touch_move(target_px, target_py)
 
-                self._current_pos = (new_x, new_y)
                 self._schedule_release_timer()
 
                 now = time.monotonic()
                 if self.on_touch_update and (now - self._last_radar_emit > 0.033):
                     self._last_radar_emit = now
-                    norm_x = (new_x - min_x) / max(1, max_x - min_x)
-                    norm_y = (new_y - min_y) / max(1, max_y - min_y)
-                    self.on_touch_update(norm_x, norm_y, True, 1)
+                    self.on_touch_update(self._norm_x, self._norm_y, True, 1)
 
             # Lock cursor inside target window during touch mode
             return 1

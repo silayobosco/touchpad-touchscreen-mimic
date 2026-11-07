@@ -9,6 +9,7 @@ from PyQt6.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QFont,
     QGuiApplication,
     QIcon,
@@ -369,6 +370,12 @@ class TouchMimicController(QMainWindow):
         # Start services
         self.tracker.start()
         self._try_start_engine()
+
+        # Standby 30 FPS radar tracking timer (renders live touchpad/mouse cursor when standby)
+        self.standby_radar_timer = QTimer(self)
+        self.standby_radar_timer.setInterval(33)
+        self.standby_radar_timer.timeout.connect(self._update_live_radar)
+        self.standby_radar_timer.start()
 
         self.hud.show()
         if start_enabled:
@@ -750,6 +757,29 @@ class TouchMimicController(QMainWindow):
                 QSystemTrayIcon.MessageIcon.Information,
                 1500,
             )
+
+    def _update_live_radar(self) -> None:
+        if self.engine.active:
+            return  # Radar is driven directly by engine touch events when active
+
+        pos = QCursor.pos()
+        gx, gy = pos.x(), pos.y()
+        rx, ry, rw, rh = self.engine.target_rect
+        if rw <= 0 or rh <= 0:
+            return
+
+        norm_x = max(0.0, min(1.0, (gx - rx) / float(rw)))
+        norm_y = max(0.0, min(1.0, (gy - ry) / float(rh)))
+        touching = QApplication.mouseButtons() != Qt.MouseButton.NoButton
+
+        self.radar.update_state(
+            norm_x,
+            norm_y,
+            touching,
+            1 if touching else 0,
+            False,
+            self.engine.margin_pct,
+        )
 
     def _on_engine_touch_update(
         self, norm_x: float, norm_y: float, touching: bool, fingers: int
