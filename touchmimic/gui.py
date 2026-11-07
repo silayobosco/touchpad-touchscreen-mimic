@@ -570,10 +570,13 @@ class TouchMimicController(QMainWindow):
             "pointer_drag",
         )
         self.emul_combo.addItem(
-            "📱 Native Kernel Multi-Touch Screen (Multi-finger / Pinch-to-Zoom)",
+            "📱 Native Windows Touch Contact (recommended)",
             "native_touch",
         )
         self.emul_combo.currentIndexChanged.connect(self._on_emul_mode_changed)
+        # Keep the visible selection in sync with the Windows engine default.
+        # This also makes real touch injection the out-of-the-box behavior.
+        self.emul_combo.setCurrentIndex(1)
         m_grid.addWidget(self.emul_combo, 0, 1, 1, 3)
 
         self.cb_triple_tap = QCheckBox("3-Finger Tap on Touchpad toggles mode")

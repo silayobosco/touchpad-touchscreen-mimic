@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from typing import Callable, Optional, Set, Tuple
 
 IS_WINDOWS = sys.platform == "win32"
@@ -47,6 +48,21 @@ HOTKEY_ID_CTRL_ALT_T = 1002
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
+# Windows touch-injection constants.  These are deliberately kept here instead
+# of relying on a third-party Win32 package so the standalone build stays
+# self-contained.
+PT_TOUCH = 0x00000002
+TOUCH_FEEDBACK_DEFAULT = 0x00000001
+POINTER_FLAG_NEW = 0x00000001
+POINTER_FLAG_INRANGE = 0x00000002
+POINTER_FLAG_INCONTACT = 0x00000004
+POINTER_FLAG_FIRSTBUTTON = 0x00000010
+POINTER_FLAG_PRIMARY = 0x00002000
+POINTER_FLAG_DOWN = 0x00010000
+POINTER_FLAG_UPDATE = 0x00020000
+POINTER_FLAG_UP = 0x00040000
+TOUCH_MASK_CONTACTAREA = 0x00000001
+
 # Synthetic event marker tag ("TMIM" = 0x544D494D)
 SYNTHETIC_MARKER = 0x544D494D
 
@@ -78,6 +94,37 @@ if IS_WINDOWS:
             ("flags", wt.DWORD),
             ("time", wt.DWORD),
             ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class POINTER_INFO(ctypes.Structure):
+        _fields_ = [
+            ("pointerType", wt.DWORD),
+            ("pointerId", wt.UINT),
+            ("frameId", wt.UINT),
+            ("pointerFlags", wt.DWORD),
+            ("sourceDevice", wt.HANDLE),
+            ("hwndTarget", wt.HWND),
+            ("ptPixelLocation", wt.POINT),
+            ("ptHimetricLocation", wt.POINT),
+            ("ptPixelLocationRaw", wt.POINT),
+            ("ptHimetricLocationRaw", wt.POINT),
+            ("dwTime", wt.DWORD),
+            ("historyCount", wt.UINT),
+            ("InputData", ctypes.c_int32),
+            ("dwKeyStates", wt.DWORD),
+            ("PerformanceCount", ctypes.c_uint64),
+            ("ButtonChangeType", wt.DWORD),
+        ]
+
+    class POINTER_TOUCH_INFO(ctypes.Structure):
+        _fields_ = [
+            ("pointerInfo", POINTER_INFO),
+            ("touchFlags", wt.DWORD),
+            ("touchMask", wt.DWORD),
+            ("rcContact", wt.RECT),
+            ("rcContactRaw", wt.RECT),
+            ("orientation", wt.DWORD),
+            ("pressure", wt.DWORD),
         ]
 
 
@@ -172,7 +219,9 @@ class WindowsTouchMimicEngine:
         self.on_error = on_error
 
         self.active: bool = False
-        self.emulation_mode: str = "pointer_drag"
+        # Native contacts are what browsers and Android emulators recognise as
+        # touch.  Mouse dragging remains a compatibility fallback only.
+        self.emulation_mode: str = "native_touch"
         self.triple_tap_toggle: bool = True
         self.hotkey_f8_toggle: bool = True
         self.ctrl_alt_t_toggle: bool = True
@@ -199,6 +248,9 @@ class WindowsTouchMimicEngine:
         self._norm_x: float = 0.5
         self._norm_y: float = 0.5
         self._last_physical_pt: Optional[Tuple[int, int]] = None
+        self._synthetic_cursor_points = deque(maxlen=8)
+        self._touch_injection_ready = False
+        self._using_native_touch = False
 
         self._release_timer: Optional[threading.Timer] = None
         self._release_timer_lock = threading.Lock()
@@ -209,12 +261,53 @@ class WindowsTouchMimicEngine:
             return False, "Windows engine requires win32 platform."
         self.stop()
         self._stop_event.clear()
+        self._touch_injection_ready = self._initialize_touch_injection()
 
         self._thread = threading.Thread(
             target=self._win32_loop, daemon=True, name="Win32TouchMimicLoop"
         )
         self._thread.start()
-        return True, f"Connected to {self.device_name}"
+        mode = "native touch injection" if self._touch_injection_ready else "mouse-drag fallback"
+        return True, f"Connected to {self.device_name} ({mode})"
+
+    def _initialize_touch_injection(self) -> bool:
+        """Enable the built-in Windows 8+ touch injector once per engine."""
+        if not IS_WINDOWS:
+            return False
+        try:
+            user32.InitializeTouchInjection.argtypes = (wt.UINT, wt.DWORD)
+            user32.InitializeTouchInjection.restype = wt.BOOL
+            user32.InjectTouchInput.argtypes = (wt.UINT, ctypes.POINTER(POINTER_TOUCH_INFO))
+            user32.InjectTouchInput.restype = wt.BOOL
+            return bool(user32.InitializeTouchInjection(1, TOUCH_FEEDBACK_DEFAULT))
+        except (AttributeError, OSError):
+            return False
+
+    def _make_touch_info(self, px: int, py: int, pointer_flags: int):
+        info = POINTER_TOUCH_INFO()
+        info.pointerInfo.pointerType = PT_TOUCH
+        info.pointerInfo.pointerId = 1
+        info.pointerInfo.pointerFlags = pointer_flags
+        info.pointerInfo.ptPixelLocation = wt.POINT(px, py)
+        # A non-zero contact rectangle is required by InjectTouchInput.
+        info.touchMask = TOUCH_MASK_CONTACTAREA
+        info.rcContact = wt.RECT(px - 2, py - 2, px + 2, py + 2)
+        return info
+
+    def _inject_native_touch(self, px: int, py: int, pointer_flags: int) -> bool:
+        if not self._touch_injection_ready:
+            return False
+        try:
+            info = self._make_touch_info(px, py, pointer_flags)
+            return bool(user32.InjectTouchInput(1, ctypes.byref(info)))
+        except (AttributeError, OSError):
+            self._touch_injection_ready = False
+            return False
+
+    def _move_fallback_cursor(self, px: int, py: int) -> None:
+        """Move the compatibility cursor without re-consuming that move as input."""
+        self._synthetic_cursor_points.append((px, py))
+        user32.SetCursorPos(px, py)
 
     def stop(self) -> None:
         self.set_active(False)
@@ -246,7 +339,11 @@ class WindowsTouchMimicEngine:
 
             self._is_touching = False
             self._last_physical_pt = None
-            user32.SetCursorPos(center_x, center_y)
+            # Native injection does not move the cursor.  Moving it here while
+            # a low-level mouse hook is active creates a feedback loop where
+            # our synthetic move is interpreted as fresh touchpad movement.
+            if self.emulation_mode == "pointer_drag" or not self._touch_injection_ready:
+                self._move_fallback_cursor(center_x, center_y)
 
             # Install hook on demand on worker thread
             if self._thread_id:
@@ -296,7 +393,20 @@ class WindowsTouchMimicEngine:
 
         self._is_injecting = True
         try:
-            user32.SetCursorPos(px, py)
+            if self.emulation_mode == "native_touch":
+                self._using_native_touch = self._inject_native_touch(
+                    px,
+                    py,
+                    POINTER_FLAG_NEW
+                    | POINTER_FLAG_INRANGE
+                    | POINTER_FLAG_INCONTACT
+                    | POINTER_FLAG_FIRSTBUTTON
+                    | POINTER_FLAG_PRIMARY
+                    | POINTER_FLAG_DOWN,
+                )
+                if self._using_native_touch:
+                    return True
+            self._move_fallback_cursor(px, py)
             user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, SYNTHETIC_MARKER)
             return True
         except Exception:
@@ -310,7 +420,17 @@ class WindowsTouchMimicEngine:
 
         self._is_injecting = True
         try:
-            user32.SetCursorPos(px, py)
+            if self._using_native_touch:
+                return self._inject_native_touch(
+                    px,
+                    py,
+                    POINTER_FLAG_INRANGE
+                    | POINTER_FLAG_INCONTACT
+                    | POINTER_FLAG_FIRSTBUTTON
+                    | POINTER_FLAG_PRIMARY
+                    | POINTER_FLAG_UPDATE,
+                )
+            self._move_fallback_cursor(px, py)
             return True
         except Exception:
             return False
@@ -323,6 +443,14 @@ class WindowsTouchMimicEngine:
 
         self._is_injecting = True
         try:
+            if self._using_native_touch:
+                rx, ry, rw, rh = self.target_rect
+                inset = min(self.top_inset_px, max(0, rh - 50))
+                px = int(rx + self._norm_x * max(1, rw))
+                py = int(ry + inset + self._norm_y * max(1, rh - inset))
+                self._inject_native_touch(px, py, POINTER_FLAG_PRIMARY | POINTER_FLAG_UP)
+                self._using_native_touch = False
+                return
             user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, SYNTHETIC_MARKER)
         except Exception:
             pass
@@ -359,7 +487,8 @@ class WindowsTouchMimicEngine:
             eff_h = max(1, rh - inset)
             center_x = rx + eff_w // 2
             center_y = ry + inset + eff_h // 2
-            user32.SetCursorPos(center_x, center_y)
+            if not self._using_native_touch:
+                self._move_fallback_cursor(center_x, center_y)
 
         self._last_physical_pt = None
         if self.on_touch_update:
@@ -397,6 +526,17 @@ class WindowsTouchMimicEngine:
 
             ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
             if ms.dwExtraInfo == SYNTHETIC_MARKER:
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # SetCursorPos has no dwExtraInfo parameter.  Its WM_MOUSEMOVE can
+            # therefore arrive after _is_injecting is cleared; recognize the
+            # exact coordinates we just emitted and never feed them back into
+            # the relative touchpad mapper.
+            if wParam == WM_MOUSEMOVE and (ms.pt.x, ms.pt.y) in self._synthetic_cursor_points:
+                try:
+                    self._synthetic_cursor_points.remove((ms.pt.x, ms.pt.y))
+                except ValueError:
+                    pass
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             # Allow physical clicks on TouchMimic, Taskbar, or Task Manager to pass through
