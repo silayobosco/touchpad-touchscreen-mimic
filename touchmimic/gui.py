@@ -348,6 +348,13 @@ class TouchMimicController(QMainWindow):
         self.hud.pinRequested.connect(self._on_toggle_pin)
         self.hud.openPanelRequested.connect(self._show_and_raise)
 
+        if hasattr(self.engine, "safe_hwnds"):
+            try:
+                self.engine.safe_hwnds.add(int(self.winId()))
+                self.engine.safe_hwnds.add(int(self.hud.winId()))
+            except Exception:
+                pass
+
         self._build_ui()
         self._setup_tray()
 

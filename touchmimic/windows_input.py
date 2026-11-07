@@ -8,7 +8,7 @@ import os
 import sys
 import threading
 import time
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Set, Tuple
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -27,37 +27,29 @@ WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+WM_USER = 0x0400
+
+WM_APP_ENABLE_HOOK = WM_USER + 10
+WM_APP_DISABLE_HOOK = WM_USER + 11
 
 WH_MOUSE_LL = 14
-WH_KEYBOARD_LL = 13
 
 VK_ESCAPE = 0x1B
 VK_F8 = 0x77
 VK_T = 0x54
-VK_CONTROL = 0x11
-VK_MENU = 0x12  # Alt
 
-INPUT_MOUSE = 0
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+
+HOTKEY_ID_F8 = 1001
+HOTKEY_ID_CTRL_ALT_T = 1002
+
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
-MOUSEEVENTF_VIRTUALDESK = 0x4000
-MOUSEEVENTF_ABSOLUTE = 0x8000
 
 # Synthetic event marker tag ("TMIM" = 0x544D494D)
 SYNTHETIC_MARKER = 0x544D494D
-
-# Windows Native Touch Injection Constants
-TOUCH_FEEDBACK_DEFAULT = 0x1
-PT_TOUCH = 0x00000002
-POINTER_FLAG_INRANGE = 0x00000002
-POINTER_FLAG_INCONTACT = 0x00000004
-POINTER_FLAG_DOWN = 0x00010000
-POINTER_FLAG_UPDATE = 0x00020000
-POINTER_FLAG_UP = 0x00040000
-TOUCH_MASK_CONTACTAREA = 0x00000001
-TOUCH_MASK_ORIENTATION = 0x00000002
-TOUCH_MASK_PRESSURE = 0x00000004
 
 
 if IS_WINDOWS:
@@ -69,69 +61,10 @@ if IS_WINDOWS:
     except Exception:
         hid = None
 
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [
-            ("dx", wt.LONG),
-            ("dy", wt.LONG),
-            ("mouseData", wt.DWORD),
-            ("dwFlags", wt.DWORD),
-            ("time", wt.DWORD),
-            ("dwExtraInfo", ctypes.c_size_t),
-        ]
-
-    class INPUT_UNION(ctypes.Union):
-        _fields_ = [("mi", MOUSEINPUT)]
-
-    class INPUT(ctypes.Structure):
-        _fields_ = [
-            ("type", wt.DWORD),
-            ("u", INPUT_UNION),
-        ]
-
-    class POINTER_INFO(ctypes.Structure):
-        _fields_ = [
-            ("pointerType", wt.DWORD),
-            ("pointerId", ctypes.c_uint32),
-            ("frameId", ctypes.c_uint32),
-            ("pointerFlags", ctypes.c_uint32),
-            ("sourceDevice", wt.HANDLE),
-            ("hwndTarget", wt.HWND),
-            ("ptPixelLocation", wt.POINT),
-            ("ptHimetricLocation", wt.POINT),
-            ("ptPixelLocationRaw", wt.POINT),
-            ("ptHimetricLocationRaw", wt.POINT),
-            ("dwTime", wt.DWORD),
-            ("historyCount", ctypes.c_uint32),
-            ("inputData", ctypes.c_int32),
-            ("dwKeyStates", wt.DWORD),
-            ("PerformanceCount", ctypes.c_uint64),
-            ("ButtonChangeType", ctypes.c_int),
-        ]
-
-    class POINTER_TOUCH_INFO(ctypes.Structure):
-        _fields_ = [
-            ("pointerInfo", POINTER_INFO),
-            ("touchFlags", ctypes.c_uint32),
-            ("touchMask", ctypes.c_uint32),
-            ("rcContact", wt.RECT),
-            ("rcContactRaw", wt.RECT),
-            ("orientation", ctypes.c_uint32),
-            ("pressure", ctypes.c_uint32),
-        ]
-
     class MSLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
             ("pt", wt.POINT),
             ("mouseData", wt.DWORD),
-            ("flags", wt.DWORD),
-            ("time", wt.DWORD),
-            ("dwExtraInfo", ctypes.c_size_t),
-        ]
-
-    class KBDLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [
-            ("vkCode", wt.DWORD),
-            ("scanCode", wt.DWORD),
             ("flags", wt.DWORD),
             ("time", wt.DWORD),
             ("dwExtraInfo", ctypes.c_size_t),
@@ -211,10 +144,10 @@ def get_windows_foreground_window_rect(
 
 
 class WindowsTouchMimicEngine:
-    """Robust Windows Precision Touchpad & Touch Injection Engine.
+    """Robust On-Demand Windows Touchpad Mimic Engine.
 
-    Directly maps physical touchpad finger movements into 1:1 absolute
-    touch contacts and drags inside the target application window.
+    Dynamically attaches the low-level mouse hook on demand only when Touch Mode
+    is active, and natively uses RegisterHotKey for global F8 / Ctrl+Alt+T shortcuts.
     """
 
     def __init__(
@@ -228,7 +161,7 @@ class WindowsTouchMimicEngine:
         self.on_error = on_error
 
         self.active: bool = False
-        self.emulation_mode: str = "pointer_drag"  # "pointer_drag" or "native_touch"
+        self.emulation_mode: str = "pointer_drag"
         self.triple_tap_toggle: bool = True
         self.hotkey_f8_toggle: bool = True
         self.ctrl_alt_t_toggle: bool = True
@@ -242,9 +175,13 @@ class WindowsTouchMimicEngine:
         self.device_name: str = "Windows Precision Touchpad"
         self.device_path: str = "HID\\UsagePage_0x0D_Usage_0x05"
 
+        self.safe_hwnds: Set[int] = set()
+
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._thread_id: Optional[int] = None
+        self._h_mouse = None
+        self._mouse_cb = None
 
         self._is_injecting: bool = False
         self._is_touching: bool = False
@@ -255,21 +192,12 @@ class WindowsTouchMimicEngine:
         self._release_timer: Optional[threading.Timer] = None
         self._release_timer_lock = threading.Lock()
         self._last_radar_emit: float = 0.0
-        self._touch_initialized: bool = False
 
     def start(self, preferred_device_path: Optional[str] = None) -> Tuple[bool, str]:
         if not IS_WINDOWS:
             return False, "Windows engine requires win32 platform."
         self.stop()
         self._stop_event.clear()
-
-        if not self._touch_initialized and hasattr(user32, "InitializeTouchInjection"):
-            try:
-                self._touch_initialized = bool(
-                    user32.InitializeTouchInjection(5, TOUCH_FEEDBACK_DEFAULT)
-                )
-            except Exception:
-                self._touch_initialized = False
 
         self._thread = threading.Thread(
             target=self._win32_loop, daemon=True, name="Win32TouchMimicLoop"
@@ -293,8 +221,8 @@ class WindowsTouchMimicEngine:
         if self.active == active:
             return
         self.active = active
+
         if active:
-            # Initialize normalized position to current cursor location inside target window (or center)
             pt = wt.POINT()
             user32.GetCursorPos(ctypes.byref(pt))
             rx, ry, rw, rh = self.target_rect
@@ -306,11 +234,19 @@ class WindowsTouchMimicEngine:
                 self._norm_y = 0.5
             self._last_physical_pt = None
             self._is_touching = False
+
+            # Install hook on demand on worker thread
+            if self._thread_id:
+                user32.PostThreadMessageW(self._thread_id, WM_APP_ENABLE_HOOK, 0, 0)
         else:
             self._cancel_release_timer()
             if self._is_touching:
                 self._emit_touch_up()
             self._last_physical_pt = None
+
+            # Detach hook on worker thread
+            if self._thread_id:
+                user32.PostThreadMessageW(self._thread_id, WM_APP_DISABLE_HOOK, 0, 0)
 
         if self.on_state_changed:
             self.on_state_changed(self.active)
@@ -338,10 +274,7 @@ class WindowsTouchMimicEngine:
         )
 
     def _is_safe_window_under_cursor(self, pt: wt.POINT) -> bool:
-        """Return True only if cursor is over TouchMimic, Taskbar, or Task Manager.
-
-        Used to ensure the user can always click TouchMimic buttons, taskbar, or Task Manager.
-        """
+        """Return True only if cursor is over TouchMimic, Taskbar, or Task Manager."""
         try:
             hwnd = user32.WindowFromPoint(pt)
             if not hwnd:
@@ -349,24 +282,14 @@ class WindowsTouchMimicEngine:
             root = user32.GetAncestor(hwnd, 2)  # GA_ROOT = 2
             target_hwnd = root if root else hwnd
 
-            cls_buf = ctypes.create_unicode_buffer(256)
-            user32.GetClassNameW(target_hwnd, cls_buf, 256)
-            cls_name = cls_buf.value.lower()
-
-            if cls_name in (
-                "shell_traywnd",
-                "shell_secondarytraywnd",
-                "dv2controlhost",
-                "taskmgr",
-            ):
+            if target_hwnd in self.safe_hwnds or hwnd in self.safe_hwnds:
                 return True
 
-            title_len = user32.GetWindowTextLengthW(target_hwnd)
-            title_buf = ctypes.create_unicode_buffer(title_len + 1)
-            user32.GetWindowTextW(target_hwnd, title_buf, title_len + 1)
-            title = title_buf.value.lower()
+            cls_buf = ctypes.create_unicode_buffer(32)
+            user32.GetClassNameW(target_hwnd, cls_buf, 32)
+            cls_name = cls_buf.value.lower()
 
-            if "touchmimic" in title or "task manager" in title:
+            if cls_name in ("shell_traywnd", "shell_secondarytraywnd", "taskmgr"):
                 return True
         except Exception:
             pass
@@ -438,124 +361,111 @@ class WindowsTouchMimicEngine:
 
     def _win32_loop(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
-        last_toggle = 0.0
+
+        # Force message queue creation for this thread
+        msg = wt.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+
+        # Register global hotkeys natively via Win32 API
+        if self.hotkey_f8_toggle:
+            user32.RegisterHotKey(None, HOTKEY_ID_F8, 0, VK_F8)
+        if self.ctrl_alt_t_toggle:
+            user32.RegisterHotKey(None, HOTKEY_ID_CTRL_ALT_T, MOD_CONTROL | MOD_ALT, VK_T)
 
         HOOKPROC = ctypes.WINFUNCTYPE(
             ctypes.c_longlong, ctypes.c_int, wt.WPARAM, wt.LPARAM
         )
 
-        def low_level_kbd_proc(nCode: int, wParam: int, lParam: int) -> int:
-            nonlocal last_toggle
-            if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                now = time.monotonic()
-
-                # Emergency disengage on Escape key
-                if kb.vkCode == VK_ESCAPE and self.active:
-                    self.set_active(False)
-                    return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
-                if now - last_toggle > 0.35:
-                    if self.hotkey_f8_toggle and kb.vkCode == VK_F8:
-                        last_toggle = now
-                        self.toggle()
-                        return 1
-                    ctrl = (user32.GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0
-                    alt = (user32.GetAsyncKeyState(VK_MENU) & 0x8000) != 0
-                    if self.ctrl_alt_t_toggle and ctrl and alt and kb.vkCode == VK_T:
-                        last_toggle = now
-                        self.toggle()
-                        return 1
-            return user32.CallNextHookEx(None, nCode, wParam, lParam)
-
         def low_level_mouse_proc(nCode: int, wParam: int, lParam: int) -> int:
-            if nCode >= 0:
-                # 1. Ignore synthetic events injected by TouchMimic to prevent re-entrancy
-                if self._is_injecting:
+            if nCode < 0:
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Emergency Escape key disengages Touch Mode
+            if (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0:
+                self.set_active(False)
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Ignore our own synthetic events to prevent re-entrancy
+            if self._is_injecting:
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            if ms.dwExtraInfo == SYNTHETIC_MARKER:
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Allow physical clicks on TouchMimic, Taskbar, or Task Manager to pass through
+            if wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN):
+                if self._is_safe_window_under_cursor(ms.pt):
+                    if self._is_touching:
+                        self._emit_touch_up()
+                    self._last_physical_pt = None
                     return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-                ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                if ms.dwExtraInfo == SYNTHETIC_MARKER:
-                    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+            # Physical button up releases touch
+            if wParam in (WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP):
+                if self._is_touching:
+                    self._emit_touch_up()
+                self._last_physical_pt = None
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-                # 2. Touch Mode Active Handling
-                if self.active:
-                    # Allow physical clicks on TouchMimic, Taskbar, or Task Manager to pass through
-                    if wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN):
-                        if self._is_safe_window_under_cursor(ms.pt):
-                            if self._is_touching:
-                                self._emit_touch_up()
-                            self._last_physical_pt = None
-                            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+            # Track physical touchpad displacement
+            if self._last_physical_pt is None:
+                self._last_physical_pt = (ms.pt.x, ms.pt.y)
+                dx = 0
+                dy = 0
+            else:
+                dx = ms.pt.x - self._last_physical_pt[0]
+                dy = ms.pt.y - self._last_physical_pt[1]
+                self._last_physical_pt = (ms.pt.x, ms.pt.y)
 
-                    # Physical button up releases touch
-                    if wParam in (WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP):
-                        if self._is_touching:
-                            self._emit_touch_up()
-                        self._last_physical_pt = None
-                        return user32.CallNextHookEx(None, nCode, wParam, lParam)
+            if dx != 0 or dy != 0:
+                rx, ry, rw, rh = self.target_rect
+                sens = 1.3
+                self._norm_x = min(1.0, max(0.0, self._norm_x + (dx / max(1, rw)) * sens))
+                self._norm_y = min(1.0, max(0.0, self._norm_y + (dy / max(1, rh)) * sens))
 
-                    # Track physical touchpad displacement
-                    if self._last_physical_pt is None:
-                        self._last_physical_pt = (ms.pt.x, ms.pt.y)
-                        dx = 0
-                        dy = 0
-                    else:
-                        dx = ms.pt.x - self._last_physical_pt[0]
-                        dy = ms.pt.y - self._last_physical_pt[1]
-                        self._last_physical_pt = (ms.pt.x, ms.pt.y)
+                px, py = self._map_to_screen_px(self._norm_x, self._norm_y)
 
-                    if dx != 0 or dy != 0:
-                        rx, ry, rw, rh = self.target_rect
-                        sens = 1.3
-                        self._norm_x = min(1.0, max(0.0, self._norm_x + (dx / max(1, rw)) * sens))
-                        self._norm_y = min(1.0, max(0.0, self._norm_y + (dy / max(1, rh)) * sens))
-
-                        px, py = self._map_to_screen_px(self._norm_x, self._norm_y)
-
-                        if not self._is_touching:
-                            self._emit_touch_down(px, py)
-                            self._is_touching = True
-                        else:
-                            self._emit_touch_move(px, py)
-
-                        self._schedule_release_timer()
-
-                        # Throttle UI radar update to ~30 FPS
-                        now = time.monotonic()
-                        if self.on_touch_update and (now - self._last_radar_emit > 0.033):
-                            self._last_radar_emit = now
-                            self.on_touch_update(
-                                self._norm_x, self._norm_y, True, 1
-                            )
-
-                    # Intercept physical movement so cursor stays locked inside target window
-                    return 1
+                if not self._is_touching:
+                    self._emit_touch_down(px, py)
+                    self._is_touching = True
                 else:
-                    self._last_physical_pt = (ms.pt.x, ms.pt.y)
-                    self._norm_x = max(0.0, min(1.0, ms.pt.x / max(1, self.screen_width)))
-                    self._norm_y = max(0.0, min(1.0, ms.pt.y / max(1, self.screen_height)))
-                    now = time.monotonic()
-                    if self.on_touch_update and (now - self._last_radar_emit > 0.05):
-                        self._last_radar_emit = now
-                        self.on_touch_update(self._norm_x, self._norm_y, False, 0)
+                    self._emit_touch_move(px, py)
 
-            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+                self._schedule_release_timer()
 
-        kbd_cb = HOOKPROC(low_level_kbd_proc)
-        mouse_cb = HOOKPROC(low_level_mouse_proc)
-        h_kbd = user32.SetWindowsHookExW(WH_KEYBOARD_LL, kbd_cb, None, 0)
-        h_mouse = user32.SetWindowsHookExW(WH_MOUSE_LL, mouse_cb, None, 0)
+                now = time.monotonic()
+                if self.on_touch_update and (now - self._last_radar_emit > 0.033):
+                    self._last_radar_emit = now
+                    self.on_touch_update(self._norm_x, self._norm_y, True, 1)
 
-        msg = wt.MSG()
+            # Lock cursor inside target window during touch mode
+            return 1
+
+        self._mouse_cb = HOOKPROC(low_level_mouse_proc)
+
         while not self._stop_event.is_set():
             ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if ret <= 0 or msg.message == WM_QUIT:
                 break
+
+            if msg.message == WM_HOTKEY:
+                self.toggle()
+            elif msg.message == WM_APP_ENABLE_HOOK:
+                if not self._h_mouse:
+                    self._h_mouse = user32.SetWindowsHookExW(
+                        WH_MOUSE_LL, self._mouse_cb, None, 0
+                    )
+            elif msg.message == WM_APP_DISABLE_HOOK:
+                if self._h_mouse:
+                    user32.UnhookWindowsHookEx(self._h_mouse)
+                    self._h_mouse = None
+
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-        if h_kbd:
-            user32.UnhookWindowsHookEx(h_kbd)
-        if h_mouse:
-            user32.UnhookWindowsHookEx(h_mouse)
+        if self._h_mouse:
+            user32.UnhookWindowsHookEx(self._h_mouse)
+            self._h_mouse = None
+        user32.UnregisterHotKey(None, HOTKEY_ID_F8)
+        user32.UnregisterHotKey(None, HOTKEY_ID_CTRL_ALT_T)
